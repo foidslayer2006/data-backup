@@ -1,0 +1,1548 @@
+--[[
+    gay script autodive with m2 mode working good
+    + post guard: prevents diving into goal posts
+]]
+
+local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
+
+local Library         = loadstring(game:HttpGet(repo .. 'Library.lua'))()
+local ThemeManager    = loadstring(game:HttpGet(repo .. 'addons/ThemeManager.lua'))()
+local SaveManager     = loadstring(game:HttpGet(repo .. 'addons/SaveManager.lua'))()
+
+local RunService          = game:GetService("RunService")
+local Players             = game:GetService("Players")
+local Workspace           = game:GetService("Workspace")
+local UserInputService    = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local BALLGRAVITY_MULT = Workspace:GetAttribute("BALLGRAVITY") or 6
+local GRAVITY          = Vector3.new(0, -9.2, 0) * BALLGRAVITY_MULT
+
+local GROUND_Y        = 0.758
+local BOUNCE_VEL_Y    = 0.4
+local BOUNCE_FRICTION = 0.70
+local SIM_STEP        = 1/200
+
+local ROLLING_FRICTION = 0.995
+local STOP_VELOCITY = 0.1
+local MIN_BOUNCE_VELOCITY = 1
+
+Workspace:GetAttributeChangedSignal("BALLGRAVITY"):Connect(function()
+    BALLGRAVITY_MULT = Workspace:GetAttribute("BALLGRAVITY") or 6
+    GRAVITY = Vector3.new(0, -9.2, 0) * BALLGRAVITY_MULT
+end)
+
+local timeStep = SIM_STEP
+
+local R_ABILITY_COOLDOWN  = 60
+local rAbilityCooldownEnd = 0
+
+local function startRCooldown()
+    rAbilityCooldownEnd = tick() + R_ABILITY_COOLDOWN
+end
+
+local function isROnCooldown()
+    return tick() < rAbilityCooldownEnd
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.R then
+        startRCooldown()
+    end
+end)
+
+local POINTS_COUNT = 101
+local MARKERS_COUNT = 15
+
+local visFolder  = nil
+local visPoints  = {}
+local visBeams   = {}
+local visMarkers = {}
+
+local PATH_VIS_ENABLED = false
+local PATH_COLOR = Color3.fromRGB(0, 255, 255)
+
+local function createPoint(folder, index)
+    local part = Instance.new("Part")
+    part.Name = "Point_" .. index
+    part.Size = Vector3.new(0.25, 0.25, 0.25)
+    part.Transparency = 1
+    part.Anchored = true
+    part.CanCollide = false
+    part.Parent = folder
+
+    local attachment = Instance.new("Attachment")
+    attachment.Parent = part
+
+    return { part = part, attachment = attachment }
+end
+
+local function buildVisuals()
+    if visFolder then return end
+
+    visFolder = Instance.new("Folder")
+    visFolder.Name = "BallPredictionVisuals"
+    visFolder.Parent = Workspace
+
+    for i = 1, POINTS_COUNT do
+        visPoints[i] = createPoint(visFolder, i)
+    end
+
+    for i = 1, POINTS_COUNT - 1 do
+        local beam = Instance.new("Beam")
+        beam.Enabled = false
+        beam.Width0 = 0.5
+        beam.Width1 = 0.5
+        beam.Transparency = NumberSequence.new(0.4)
+        beam.Attachment0 = visPoints[i].attachment
+        beam.Attachment1 = visPoints[i + 1].attachment
+        beam.Parent = visFolder
+        visBeams[i] = beam
+    end
+
+    for i = 1, MARKERS_COUNT do
+        local marker = Instance.new("Part")
+        marker.Shape = Enum.PartType.Ball
+        marker.Size = Vector3.new(0.45, 0.45, 0.45)
+        marker.Material = Enum.Material.Neon
+        marker.Anchored = true
+        marker.CanCollide = false
+        marker.Parent = visFolder
+        visMarkers[i] = marker
+    end
+end
+
+local function clearPathVisuals()
+    for _, beam in ipairs(visBeams) do
+        beam.Enabled = false
+    end
+    for _, marker in ipairs(visMarkers) do
+        marker.Transparency = 1
+    end
+end
+
+local function renderPath(pathPoints, bouncePoints)
+    if not PATH_VIS_ENABLED then clearPathVisuals(); return end
+    if #visPoints == 0 then buildVisuals() end
+
+    local total = #pathPoints
+    if total == 0 then clearPathVisuals(); return end
+
+    for i = 1, POINTS_COUNT do
+        local rawIdx = ((i - 1) / (POINTS_COUNT - 1)) * (total - 1) + 1
+        local idx    = math.max(1, math.min(total, math.floor(rawIdx + 0.5)))
+        local pos    = pathPoints[idx]
+        if pos then
+            visPoints[i].part.Position = pos
+        end
+    end
+
+    for i = 1, POINTS_COUNT - 1 do
+        visBeams[i].Enabled = true
+        visBeams[i].Color   = ColorSequence.new(PATH_COLOR)
+    end
+
+    for i = 1, MARKERS_COUNT do
+        local m  = visMarkers[i]
+        local bp = bouncePoints[i]
+        if m and bp then
+            m.Position     = bp
+            m.Transparency = 0.3
+        elseif m then
+            m.Transparency = 1
+        end
+    end
+end
+
+local function destroyVisuals()
+    clearPathVisuals()
+    if visFolder and visFolder.Parent then visFolder:Destroy() end
+    visFolder  = nil
+    visPoints  = {}
+    visBeams   = {}
+    visMarkers = {}
+end
+
+local MODE_B_TOP_THRESHOLD = 4.8
+local MODE_B_DURATION      = 0.6
+local MODE_B_SOUND_ID      = "rbxassetid://73498467353516"
+local modeB_active         = false
+local modeB_endTime        = 0
+local lastSoundCheck       = 0
+local SOUND_CHECK_INTERVAL = 0.1
+
+local trackedSounds = {}
+
+local function refreshTrackedSounds(soundId)
+    trackedSounds = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("Sound") and obj.SoundId == soundId then
+            table.insert(trackedSounds, obj)
+        end
+    end
+end
+refreshTrackedSounds(MODE_B_SOUND_ID)
+
+Workspace.DescendantAdded:Connect(function(obj)
+    if obj:IsA("Sound") and obj.SoundId == MODE_B_SOUND_ID then
+        table.insert(trackedSounds, obj)
+    end
+end)
+Workspace.DescendantRemoving:Connect(function(obj)
+    for i, s in ipairs(trackedSounds) do
+        if s == obj then table.remove(trackedSounds, i); break end
+    end
+end)
+
+local function isModeBSoundPlaying()
+    for _, sound in ipairs(trackedSounds) do
+        if sound.IsPlaying then return true end
+    end
+    return false
+end
+
+local function updateMode(currentTime)
+    if modeB_active then
+        if currentTime >= modeB_endTime then
+            modeB_active = false
+        end
+        return
+    end
+    if currentTime - lastSoundCheck < SOUND_CHECK_INTERVAL then return end
+    lastSoundCheck = currentTime
+    if isModeBSoundPlaying() then
+        modeB_active  = true
+        modeB_endTime = currentTime + MODE_B_DURATION
+    end
+end
+
+-- Panel size mirrors the left goal dimensions for zone calculations
+local leftGoalSize = Vector3.new(60.53413009643555, 40.148765563964844, 0.700118899345398)
+
+local currentPanelCF = CFrame.new()
+
+local ZONE_NAMES = {
+    "TOP_LEFT","TOP_MID_LEFT","TOP_MIDDLE","TOP_MID_RIGHT","TOP_RIGHT",
+    "BOTTOM_LEFT","BOTTOM_MID_LEFT","BOTTOM_MIDDLE","BOTTOM_MID_RIGHT","BOTTOM_RIGHT",
+}
+local ZONE_COLOR_INACTIVE = Color3.fromRGB(0,  180, 255)
+local ZONE_COLOR_ACTIVE   = Color3.fromRGB(255,  60,  60)
+local ZONE_ALPHA_INACTIVE = 0.92
+local ZONE_ALPHA_ACTIVE   = 0.30
+
+local function splitZone(name)
+    local r, c = name:match("^(TOP)_(.+)$")
+    if not r then r, c = name:match("^(BOTTOM)_(.+)$") end
+    return r, c
+end
+
+local function getZoneName(worldHit, gcf, gs, mf, msf, heightThreshold)
+    heightThreshold = heightThreshold or 0
+    local lh    = gcf:PointToObjectSpace(worldHit)
+    local midW  = gs.X * mf
+    local hm    = midW / 2
+    local sideW = (gs.X - midW) / 2
+    local msW   = sideW * msf
+    local b1, b2, b3, b4 = -(hm+msW), -hm, hm, hm+msW
+    local col
+    if     lh.X < b1 then col = "LEFT"
+    elseif lh.X < b2 then col = "MID_LEFT"
+    elseif lh.X < b3 then col = "MIDDLE"
+    elseif lh.X < b4 then col = "MID_RIGHT"
+    else                   col = "RIGHT"
+    end
+    return (lh.Y >= heightThreshold and "TOP" or "BOTTOM") .. "_" .. col
+end
+
+local GoalZones = {}
+GoalZones.__index = GoalZones
+
+local function createZoneParts(gs, mf, msf, visible, heightThreshold)
+    local zones   = {}
+    local midW    = gs.X * mf
+    local hm      = midW / 2
+    local sideW   = (gs.X - midW) / 2
+    local msW     = sideW * msf
+    local outerW  = sideW - msW
+    local colData = {
+        LEFT      = { offset = -(hm + msW + outerW/2), width = outerW },
+        MID_LEFT  = { offset = -(hm + msW/2),           width = msW   },
+        MIDDLE    = { offset = 0,                        width = midW  },
+        MID_RIGHT = { offset =  hm + msW/2,             width = msW   },
+        RIGHT     = { offset =  hm + msW + outerW/2,    width = outerW },
+    }
+    local ht    = math.clamp(heightThreshold or 0, -(gs.Y/2 - 1), gs.Y/2 - 1)
+    local topH  = gs.Y/2 - ht
+    local botH  = gs.Y/2 + ht
+    local rowData = {
+        TOP    = { offset = ht + topH/2, height = topH },
+        BOTTOM = { offset = ht - botH/2, height = botH },
+    }
+
+    for _, zn in ipairs(ZONE_NAMES) do
+        local row, col = splitZone(zn)
+        local cd, rd   = colData[col], rowData[row]
+        local p = Instance.new("Part")
+        p.Anchored    = true
+        p.CanCollide  = false
+        p.CastShadow  = false
+        p.Material    = Enum.Material.Neon
+        p.Color       = ZONE_COLOR_INACTIVE
+        p.Size        = Vector3.new(cd.width - 0.4, rd.height - 0.4, 0.1)
+        p:SetAttribute("LocalOffsetX", cd.offset)
+        p:SetAttribute("LocalOffsetY", rd.offset)
+        p.Transparency = visible and ZONE_ALPHA_INACTIVE or 1
+        p.Parent       = Workspace
+        zones[zn]      = p
+    end
+    return zones
+end
+
+function GoalZones.new(gs, opts)
+    opts = opts or {}
+    local self = setmetatable({}, GoalZones)
+    self.gs              = gs
+    self.visible         = (opts.visible == nil) and true or opts.visible
+    self.mf              = opts.mf  or 0.2
+    self.msf             = opts.msf or 0.28
+    self.heightThreshold = opts.heightThreshold or 1.6
+    self._active         = nil
+    self.zones           = createZoneParts(gs, self.mf, self.msf, self.visible, self.heightThreshold)
+    return self
+end
+
+function GoalZones:rebuild()
+    local av = self._active
+    for _, p in pairs(self.zones) do
+        if p and p.Parent then p:Destroy() end
+    end
+    self.zones = createZoneParts(self.gs, self.mf, self.msf, self.visible, self.heightThreshold)
+    if av then self:showFullZone(av) end
+end
+
+function GoalZones:setMF(v)
+    self.mf = math.clamp(v, 0.05, 0.90)
+    self:rebuild()
+end
+
+function GoalZones:setMSF(v)
+    self.msf = math.clamp(v, 0.05, 0.95)
+    self:rebuild()
+end
+
+function GoalZones:setHeightThreshold(v)
+    self.heightThreshold = v
+    self:rebuild()
+end
+
+function GoalZones:showFullZone(zn)
+    self._active = zn
+    for name, p in pairs(self.zones) do
+        if name == zn then
+            p.Color        = ZONE_COLOR_ACTIVE
+            p.Transparency = self.visible and ZONE_ALPHA_ACTIVE or 1
+        else
+            p.Color        = ZONE_COLOR_INACTIVE
+            p.Transparency = self.visible and ZONE_ALPHA_INACTIVE or 1
+        end
+    end
+end
+
+function GoalZones:hideAll()
+    self._active = nil
+    for _, p in pairs(self.zones) do
+        p.Color        = ZONE_COLOR_INACTIVE
+        p.Transparency = self.visible and ZONE_ALPHA_INACTIVE or 1
+    end
+end
+
+function GoalZones:setVisible(v)
+    self.visible = v
+    for _, p in pairs(self.zones) do
+        local isActive = (p.Color == ZONE_COLOR_ACTIVE)
+        p.Transparency = isActive and (v and ZONE_ALPHA_ACTIVE or 1)
+                                  or  (v and ZONE_ALPHA_INACTIVE or 1)
+    end
+end
+
+function GoalZones:destroy()
+    for _, p in pairs(self.zones) do
+        if p and p.Parent then p:Destroy() end
+    end
+    self.zones = {}
+end
+
+local ZONE_MID_FRAC        = 0.32
+local ZONE_MID_SIDE_FRAC   = 0.27
+local MODE_A_TOP_THRESHOLD = 4.8
+
+local ACRO_TOP_THRESHOLD        = 6.8
+local MID_TOP_THRESHOLD         = 4.8
+local MID_IFRAME_TOP_THRESHOLD  = 4.8
+
+local sharedZones = GoalZones.new(leftGoalSize,
+    { visible=false, mf=ZONE_MID_FRAC, msf=ZONE_MID_SIDE_FRAC, heightThreshold=MODE_A_TOP_THRESHOLD })
+
+local PANEL_DISTANCE   = -1
+local PANEL_HEIGHT_ADJ = 0
+
+RunService.RenderStepped:Connect(function()
+    local char = Players.LocalPlayer and Players.LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local panelCF = hrp.CFrame
+        * CFrame.new(0, PANEL_HEIGHT_ADJ, PANEL_DISTANCE)
+        * CFrame.Angles(0, math.pi, 0)
+
+    currentPanelCF = panelCF
+
+    for _, part in pairs(sharedZones.zones) do
+        if part and part.Parent then
+            local ox = part:GetAttribute("LocalOffsetX") or 0
+            local oy = part:GetAttribute("LocalOffsetY") or 0
+            part.CFrame = panelCF * CFrame.new(ox, oy, 0)
+        end
+    end
+end)
+
+local function applyHeightThreshold()
+    local ht = modeB_active and MODE_B_TOP_THRESHOLD or MODE_A_TOP_THRESHOLD
+    sharedZones:setHeightThreshold(ht)
+end
+
+-- ── Post Proximity Guard ─────────────────────────────────────────────────────
+local GOAL_POST_DATA          = {}
+local POST_GUARD_DISTANCE     = 18.0
+local POST_GUARD_OFFSET_BONUS = 0
+local postGuardEnabled        = true
+
+local function buildGoalPostData()
+    GOAL_POST_DATA = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "GoalPost" and obj:IsA("BasePart") then
+            local cx = obj.Position.X
+            local cz = obj.Position.Z
+            local hw = obj.Size.X / 2
+            table.insert(GOAL_POST_DATA, {
+                leftX   = cx - hw,
+                rightX  = cx + hw,
+                centerZ = cz,
+            })
+        end
+    end
+end
+buildGoalPostData()
+
+workspace.DescendantAdded:Connect(function(obj)
+    if obj.Name == "GoalPost" and obj:IsA("BasePart") then
+        buildGoalPostData()
+    end
+end)
+
+local function getNearestGoalPostData()
+    local char = Players.LocalPlayer and Players.LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp or #GOAL_POST_DATA == 0 then return nil end
+    local pz = hrp.Position.Z
+    local best, bestDist = nil, math.huge
+    for _, gp in ipairs(GOAL_POST_DATA) do
+        local d = math.abs(pz - gp.centerZ)
+        if d < bestDist then bestDist = d; best = gp end
+    end
+    return best
+end
+
+local function getPostGuardOverride(zoneName, hasIframes)
+    if not postGuardEnabled then return zoneName, false end
+    local char = Players.LocalPlayer and Players.LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return zoneName, false end
+
+    local row, col = splitZone(zoneName)
+    if not row then return zoneName, false end
+
+    local gp = getNearestGoalPostData()
+    if not gp then return zoneName, false end
+
+    local playerX     = hrp.Position.X
+    local distToLeft  = math.abs(playerX - gp.leftX)
+    local distToRight = math.abs(playerX - gp.rightX)
+
+    -- Too close to LEFT post and diving LEFT → redirect to middle
+    if distToLeft <= POST_GUARD_DISTANCE and (col == "LEFT" or col == "MID_LEFT") then
+        return row .. "_MIDDLE", true
+    end
+
+    -- Too close to RIGHT post and diving RIGHT → redirect to middle
+    if distToRight <= POST_GUARD_DISTANCE and (col == "RIGHT" or col == "MID_RIGHT") then
+        return row .. "_MIDDLE", true
+    end
+
+    return zoneName, false
+end
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local BallFolder = Workspace:FindFirstChild("BallFolderServer")
+if not BallFolder then
+    BallFolder = Instance.new("Folder")
+    BallFolder.Name = "BallFolderServer"
+    BallFolder.Parent = Workspace
+end
+
+local ballIframesState = {}
+local ballIframesConns = {}
+
+local function watchBallIframes(model)
+    if ballIframesConns[model] then return end
+    local serverBall = model:FindFirstChild("ServerBall")
+    if not serverBall then return end
+
+    ballIframesState[model] = serverBall:FindFirstChild("IFRAMES") ~= nil
+
+    local addedConn = serverBall.ChildAdded:Connect(function(child)
+        if child.Name == "IFRAMES" then ballIframesState[model] = true end
+    end)
+    local removedConn = serverBall.ChildRemoved:Connect(function(child)
+        if child.Name == "IFRAMES" then ballIframesState[model] = false end
+    end)
+    ballIframesConns[model] = { addedConn, removedConn }
+end
+
+local function unwatchBallIframes(model)
+    local conns = ballIframesConns[model]
+    if conns then
+        for _, c in ipairs(conns) do c:Disconnect() end
+        ballIframesConns[model] = nil
+    end
+    ballIframesState[model] = nil
+end
+
+local function isValidBall(model)
+    if not model:IsA("Model") then return false end
+    if model.Name ~= "ballEntity" then return false end
+    return model:FindFirstChild("Position")
+        and model:FindFirstChild("Velocity")
+        and model:FindFirstChild("BallSpeed")
+end
+
+local function getModifiers(ball)
+    local modifiers = {}
+    local part = ball:FindFirstChild("ServerBall")
+    if not part then return modifiers end
+    local riptide = part:FindFirstChild("RIPTIDE")
+    if riptide then
+        table.insert(modifiers, {
+            Type = "RIPTIDE",
+            Direction = riptide.Value,
+            EndTime = riptide:GetAttribute("ENDTIME") or 0
+        })
+    end
+    return modifiers
+end
+
+for _, model in ipairs(BallFolder:GetChildren()) do
+    if isValidBall(model) then watchBallIframes(model) end
+end
+
+BallFolder.ChildAdded:Connect(function(model)
+    if isValidBall(model) then watchBallIframes(model) end
+end)
+BallFolder.ChildRemoved:Connect(function(model)
+    unwatchBallIframes(model)
+end)
+
+local function applyModifiers(velocity, modifiers, time, step)
+    for _, mod in ipairs(modifiers) do
+        if mod.Type == "RIPTIDE" and time <= mod.EndTime then
+            velocity = velocity + mod.Direction * (step * 102)
+        end
+    end
+    return velocity
+end
+
+local function getValidBalls()
+    local validBalls = {}
+    for _, ball in ipairs(BallFolder:GetChildren()) do
+        if isValidBall(ball) then
+            table.insert(validBalls, {
+                model      = ball,
+                position   = ball.Position.Value,
+                velocity   = ball.Velocity.Value,
+                speed      = ball.BallSpeed.Value,
+                modifiers  = getModifiers(ball),
+                hasIframes = ballIframesState[ball] == true
+            })
+        end
+    end
+    return validBalls
+end
+
+local function simulatePath(position, velocity, modifiers, duration, step)
+    local time = 0
+    local points = {position}
+    local bounces = 0
+    local bouncePoints = {}
+    local isRolling = false
+
+    while time < duration do
+        velocity = applyModifiers(velocity, modifiers, time, step)
+        if isRolling then
+            velocity = velocity * ROLLING_FRICTION
+            if velocity.Magnitude < STOP_VELOCITY then
+                table.insert(points, position)
+                break
+            end
+            position = position + velocity * step
+        else
+            velocity = velocity + GRAVITY * step
+            position = position + velocity * step
+        end
+        if position.Y < GROUND_Y then
+            position = Vector3.new(position.X, GROUND_Y, position.Z)
+            bounces = bounces + 1
+            if bounces <= MARKERS_COUNT then
+                table.insert(bouncePoints, position)
+            end
+            if math.abs(velocity.Y) * BOUNCE_VEL_Y < MIN_BOUNCE_VELOCITY then
+                isRolling = true
+                velocity = Vector3.new(velocity.X * BOUNCE_FRICTION, 0, velocity.Z * BOUNCE_FRICTION)
+            else
+                velocity = Vector3.new(velocity.X * BOUNCE_FRICTION, math.abs(velocity.Y) * BOUNCE_VEL_Y, velocity.Z * BOUNCE_FRICTION)
+            end
+        end
+        table.insert(points, position)
+        time = time + step
+    end
+
+    return points, bouncePoints
+end
+
+local function predictPanelHit(position, velocity, modifiers)
+    local time       = 0
+    local step       = SIM_STEP
+    local maxDuration = 5
+    local currentPos = position
+    local currentVel = velocity
+    local isRolling  = false
+    local prevPos    = currentPos
+
+    local panelCF     = currentPanelCF
+    local panelNormal = panelCF.LookVector
+    local panelOrigin = panelCF.Position
+    local halfW       = leftGoalSize.X / 2
+    local halfH       = leftGoalSize.Y / 2
+
+    while time < maxDuration do
+        currentVel = applyModifiers(currentVel, modifiers, time, step)
+        prevPos = currentPos
+
+        if isRolling then
+            currentVel = currentVel * ROLLING_FRICTION
+            if currentVel.Magnitude < STOP_VELOCITY then break end
+            currentPos = currentPos + currentVel * step
+        else
+            currentVel = currentVel + GRAVITY * step
+            currentPos = currentPos + currentVel * step
+        end
+
+        if currentPos.Y < GROUND_Y then
+            currentPos = Vector3.new(currentPos.X, GROUND_Y, currentPos.Z)
+            if math.abs(currentVel.Y) * BOUNCE_VEL_Y < MIN_BOUNCE_VELOCITY then
+                isRolling = true
+                currentVel = Vector3.new(currentVel.X * BOUNCE_FRICTION, 0, currentVel.Z * BOUNCE_FRICTION)
+            else
+                currentVel = Vector3.new(currentVel.X * BOUNCE_FRICTION, math.abs(currentVel.Y) * BOUNCE_VEL_Y, currentVel.Z * BOUNCE_FRICTION)
+            end
+        end
+
+        local dPrev = (prevPos    - panelOrigin):Dot(panelNormal)
+        local dCurr = (currentPos - panelOrigin):Dot(panelNormal)
+
+        if dPrev * dCurr <= 0 and dPrev ~= dCurr then
+            local t      = dPrev / (dPrev - dCurr)
+            local hitPos = prevPos + (currentPos - prevPos) * t
+
+            local localHit = panelCF:PointToObjectSpace(hitPos)
+            if math.abs(localHit.X) <= halfW and math.abs(localHit.Y) <= halfH then
+                return time + step * t, hitPos
+            end
+        end
+
+        time = time + step
+    end
+
+    return nil, nil
+end
+
+local tracking          = false
+local startTime         = 0
+local trackingStartTime = 0
+local trackingTimeout   = 2.0
+local predictedTime     = 0
+local goalCooldownEnd   = 0
+local diveCooldownEnd   = 0
+local currentBallModel  = nil
+local lastKnownDistance = math.huge
+local missedFrames      = 0
+
+local autodiveEnabled = false
+
+local baseOffset           = 0.38
+local midSideOffset        = 0.35
+local topMidSideOffset     = 0.36
+local midOffsetTop         = 0.36
+local midOffsetBot         = 0.35
+local midOffsetIframesTop  = 0.36
+local midOffsetIframesBot  = 0.35
+local modeBBaseOffset      = 0.6
+local modeBBotMidOffset    = 0.43
+local modeBTopMidOffset    = 0.45
+local modeBMidOffset       = .45
+local modeAJumpDelay       = 0.06
+local modeBJumpDelay       = 0.0
+local midTopJumpPreDelay   = 0.0
+local diveCooldownTime     = 0.75
+local m2JumpDelay          = 0
+
+local AutodiveToggle
+local function setAutodiveEnabled(enabled)
+    autodiveEnabled = enabled
+    if AutodiveToggle then AutodiveToggle:SetValue(enabled) end
+end
+
+-- ========== ACRO MODE ==========
+local acroJumpDelay       = 0
+local acroMode            = false
+local acroModeCheckbox    = false
+local acroModeFromKey     = false
+local previousAutodiveStateAcro = false
+local AcroStatusLabel     = nil
+
+local function updateAcroMode()
+    acroMode = acroModeCheckbox or acroModeFromKey
+    if AcroStatusLabel then
+        if acroModeCheckbox then
+            AcroStatusLabel:SetText("Acro Mode: ON (Permanent)")
+        elseif acroModeFromKey then
+            AcroStatusLabel:SetText(autodiveMode == "Toggle"
+                and "Acro Mode: ON (Toggled)"
+                or  "Acro Mode: ON (Hold)")
+        else
+            AcroStatusLabel:SetText("Acro Mode: OFF")
+        end
+    end
+end
+
+local function activateAcroKey()
+    if not acroModeFromKey then
+        previousAutodiveStateAcro = autodiveEnabled
+        if not autodiveEnabled then setAutodiveEnabled(true) end
+        acroModeFromKey = true
+        updateAcroMode()
+    end
+end
+
+local function deactivateAcroKey()
+    if acroModeFromKey then
+        acroModeFromKey = false
+        updateAcroMode()
+        setAutodiveEnabled(previousAutodiveStateAcro)
+    end
+end
+
+-- ========== M2-ONLY MODE ==========
+local m2OnlyMode          = false
+local m2OnlyModeCheckbox  = false
+local m2OnlyModeFromKey   = false
+local autodiveMode        = "Hold"
+local previousAutodiveState = false
+local M2StatusLabel       = nil
+
+local function updateM2OnlyMode()
+    m2OnlyMode = m2OnlyModeCheckbox or m2OnlyModeFromKey
+    if M2StatusLabel then
+        if m2OnlyModeCheckbox then
+            M2StatusLabel:SetText("M2 Mode: ON (Permanent)")
+        elseif m2OnlyModeFromKey then
+            if autodiveMode == "Toggle" then
+                M2StatusLabel:SetText("M2 Mode: ON (Toggled)")
+            else
+                M2StatusLabel:SetText("M2 Mode: ON (Hold)")
+            end
+        else
+            M2StatusLabel:SetText("M2 Mode: OFF")
+        end
+    end
+end
+
+local function getEffectiveTopThreshold(col, hasIframes)
+    if acroMode then
+        return ACRO_TOP_THRESHOLD
+    end
+    if col == "MIDDLE" then
+        if hasIframes then
+            return MID_IFRAME_TOP_THRESHOLD
+        else
+            return MID_TOP_THRESHOLD
+        end
+    end
+    return modeB_active and MODE_B_TOP_THRESHOLD or MODE_A_TOP_THRESHOLD
+end
+
+local function getDiveOffset(zoneName, hasIframes)
+    local row, col = splitZone(zoneName)
+    if modeB_active then
+        if col == "MID_LEFT" or col == "MID_RIGHT" then
+            return row == "TOP" and modeBTopMidOffset or modeBBotMidOffset
+        elseif col == "MIDDLE" then
+            return modeBMidOffset
+        else
+            return modeBBaseOffset
+        end
+    else
+        if col == "MID_LEFT" or col == "MID_RIGHT" then
+            return row == "TOP" and topMidSideOffset or midSideOffset
+        elseif col == "MIDDLE" then
+            if hasIframes then
+                return row == "TOP" and midOffsetIframesTop or midOffsetIframesBot
+            else
+                return row == "TOP" and midOffsetTop or midOffsetBot
+            end
+        else
+            return baseOffset
+        end
+    end
+end
+
+local mb2HeldByUser = false
+
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton2 then
+        mb2HeldByUser = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(inp, gp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton2 then
+        mb2HeldByUser = false
+    end
+end)
+
+local MOUSE_BUTTON_MAP = {
+    MB1 = Enum.UserInputType.MouseButton1,
+    MB2 = Enum.UserInputType.MouseButton2,
+    MB3 = Enum.UserInputType.MouseButton3,
+}
+
+local function getPickerKeyCode(pickerName, fallback)
+    local picker = Options and Options[pickerName]
+    local val = picker and picker.Value or fallback
+    if typeof(val) == "EnumItem" then return val end
+    if type(val) == "string" then
+        if MOUSE_BUTTON_MAP[val] then return MOUSE_BUTTON_MAP[val] end
+        local ok, kc = pcall(function() return Enum.KeyCode[val] end)
+        if ok and kc then return kc end
+    end
+    if fallback then
+        if MOUSE_BUTTON_MAP[fallback] then return MOUSE_BUTTON_MAP[fallback] end
+        local ok, kc = pcall(function() return Enum.KeyCode[fallback] end)
+        if ok then return kc end
+    end
+    return nil
+end
+
+local function pressEnum(kc)
+    if not kc then return end
+    pcall(function()
+        if typeof(kc) == "EnumItem" and kc.EnumType == Enum.UserInputType then
+            local buttonIndex
+            if kc == Enum.UserInputType.MouseButton1 then
+                buttonIndex = 0
+            elseif kc == Enum.UserInputType.MouseButton2 then
+                buttonIndex = 1
+            elseif kc == Enum.UserInputType.MouseButton3 then
+                buttonIndex = 2
+            else
+                return
+            end
+            if kc == Enum.UserInputType.MouseButton2 and mb2HeldByUser then
+                VirtualInputManager:SendMouseButtonEvent(0, 0, buttonIndex, false, game, 0)
+                mb2HeldByUser = false
+            else
+                VirtualInputManager:SendMouseButtonEvent(0, 0, buttonIndex, true, game, 0)
+                RunService.RenderStepped:Wait()
+                VirtualInputManager:SendMouseButtonEvent(0, 0, buttonIndex, false, game, 0)
+            end
+        else
+            if kc == Enum.KeyCode.R then startRCooldown() end
+            VirtualInputManager:SendKeyEvent(true, kc, false, game)
+            RunService.RenderStepped:Wait()
+            VirtualInputManager:SendKeyEvent(false, kc, false, game)
+        end
+    end)
+end
+
+local function resolveMidKey(hasIframes, row)
+    if hasIframes then
+        local key = row == "TOP" and 'DiveMidTopIframesKey' or 'DiveMidBotIframesKey'
+        return getPickerKeyCode(key, 'R')
+    end
+    if isROnCooldown() then
+        return Enum.UserInputType.MouseButton2
+    end
+    if math.random(2) == 1 then
+        local key = row == "TOP" and 'DiveMidTopKey' or 'DiveMidBotKey'
+        return getPickerKeyCode(key, 'R')
+    else
+        return Enum.UserInputType.MouseButton2
+    end
+end
+
+local function performDive(zoneName, hasIframes)
+    if not zoneName then return end
+
+    local row, col = splitZone(zoneName)
+    local doJump   = (row == "TOP")
+
+    local leftKey  = getPickerKeyCode('DiveLeftKey',  'C')
+    local rightKey = getPickerKeyCode('DiveRightKey', 'Z')
+    local jumpKey  = getPickerKeyCode('DiveJumpKey',  'Space')
+
+    local midKey
+    if col == "MIDDLE" then
+        midKey = resolveMidKey(hasIframes, row)
+    end
+
+    local directionKey
+    if m2OnlyMode then
+        directionKey = Enum.UserInputType.MouseButton2
+    elseif acroMode then
+        directionKey = getPickerKeyCode('DiveMidTopKey', 'R')
+    else
+        if col == "LEFT" or col == "MID_LEFT" then
+            directionKey = leftKey
+        elseif col == "RIGHT" or col == "MID_RIGHT" then
+            directionKey = rightKey
+        else
+            directionKey = midKey
+        end
+    end
+
+    if doJump then
+        pressEnum(jumpKey)
+        local jumpDelay
+        if m2OnlyMode then
+            jumpDelay = m2JumpDelay
+        elseif acroMode then
+            jumpDelay = acroJumpDelay
+        else
+            jumpDelay = modeB_active and modeBJumpDelay or modeAJumpDelay
+        end
+        task.wait(jumpDelay)
+    end
+
+    local isLeftRight = (directionKey == leftKey or directionKey == rightKey)
+    if isLeftRight then
+        task.spawn(function() pressEnum(Enum.UserInputType.MouseButton1) end)
+    end
+    pressEnum(directionKey)
+
+    diveCooldownEnd = tick() + diveCooldownTime
+end
+
+-- ============================================================================
+-- LinoriaLib UI
+-- ============================================================================
+local Window = Library:CreateWindow({
+    Title    = 'Nigga Hub',
+    Center   = true,
+    AutoShow = false,
+})
+
+local Tabs = {
+    Main     = Window:AddTab('Main'),
+    Zones    = Window:AddTab('Zones'),
+    Settings = Window:AddTab('Settings'),
+}
+
+local StatusGroup    = Tabs.Main:AddLeftGroupbox('Tracking')
+local StatusLabel    = StatusGroup:AddLabel('Waiting for ball...')
+local PredictedLabel = StatusGroup:AddLabel('Predicted: --')
+local ActualLabel    = StatusGroup:AddLabel('Actual: --')
+local DiffLabel      = StatusGroup:AddLabel('Difference: --')
+local ZoneLabel      = StatusGroup:AddLabel('Zone: --')
+local ModeLabel      = StatusGroup:AddLabel('MODE: A (default)')
+local RCooldownLabel = StatusGroup:AddLabel('R Cooldown: ready')
+
+Tabs.Main:AddLeftGroupbox('Mode B'):AddLabel('Triggered by sound ID (see Settings)')
+
+local AutodiveGroup  = Tabs.Main:AddLeftGroupbox('Autodive')
+AutodiveToggle = AutodiveGroup:AddToggle('AutodiveToggle', {
+    Text     = 'Enable Autodive',
+    Default  = false,
+    Callback = function(val)
+        autodiveEnabled = val
+    end,
+})
+
+AutodiveGroup:AddToggle('AcroModeToggle', {
+    Text     = 'Acro Mode (always press R for all dives)',
+    Default  = false,
+    Callback = function(val)
+        acroModeCheckbox = val
+        updateAcroMode()
+    end,
+})
+AcroStatusLabel = AutodiveGroup:AddLabel('Acro Mode: OFF')
+
+AutodiveGroup:AddToggle('M2OnlyToggle', {
+    Text     = 'M2 Only Mode (use MB2 for all dives)',
+    Default  = false,
+    Callback = function(val)
+        m2OnlyModeCheckbox = val
+        updateM2OnlyMode()
+    end,
+})
+M2StatusLabel = AutodiveGroup:AddLabel('M2 Mode: OFF')
+
+local ZoneWidthGroup = Tabs.Zones:AddLeftGroupbox('Horizontal Sizing')
+ZoneWidthGroup:AddSlider('MiddleWidth', {
+    Text = 'Middle Width', Min = 0.05, Max = 0.90,
+    Default = ZONE_MID_FRAC, Rounding = 2,
+    Callback = function(val)
+        ZONE_MID_FRAC = val
+        sharedZones:setMF(val)
+    end,
+})
+ZoneWidthGroup:AddSlider('MidSideWidth', {
+    Text = 'Mid-Side Width', Min = 0.05, Max = 0.95,
+    Default = ZONE_MID_SIDE_FRAC, Rounding = 2,
+    Callback = function(val)
+        ZONE_MID_SIDE_FRAC = val
+        sharedZones:setMSF(val)
+    end,
+})
+
+local HeightGroup      = Tabs.Zones:AddLeftGroupbox('Vertical Split (TOP / BOTTOM)')
+local GOAL_HALF_HEIGHT = leftGoalSize.Y / 2
+HeightGroup:AddSlider('ModeATop', {
+    Text = 'Mode A Top Y (studs)', Min = 0, Max = GOAL_HALF_HEIGHT,
+    Default = MODE_A_TOP_THRESHOLD, Rounding = 1,
+    Callback = function(val)
+        MODE_A_TOP_THRESHOLD = val
+        if not modeB_active then sharedZones:setHeightThreshold(val) end
+    end,
+})
+HeightGroup:AddSlider('ModeBTop', {
+    Text = 'Mode B Top Y (studs)', Min = 0, Max = GOAL_HALF_HEIGHT,
+    Default = MODE_B_TOP_THRESHOLD, Rounding = 1,
+    Callback = function(val)
+        MODE_B_TOP_THRESHOLD = val
+        if modeB_active then sharedZones:setHeightThreshold(val) end
+    end,
+})
+HeightGroup:AddSlider('AcroTopY', {
+    Text = 'Acro Mode Top Y (studs)', Min = 0, Max = GOAL_HALF_HEIGHT,
+    Default = ACRO_TOP_THRESHOLD, Rounding = 1,
+    Callback = function(val)
+        ACRO_TOP_THRESHOLD = val
+    end,
+})
+HeightGroup:AddSlider('MidZoneTopY', {
+    Text = 'Middle Zone Top Y (studs)', Min = 0, Max = GOAL_HALF_HEIGHT,
+    Default = MID_TOP_THRESHOLD, Rounding = 1,
+    Callback = function(val)
+        MID_TOP_THRESHOLD = val
+    end,
+})
+HeightGroup:AddSlider('MidIframeTopY', {
+    Text = 'Middle Zone Top Y – IFRAMES (studs)', Min = 0, Max = GOAL_HALF_HEIGHT,
+    Default = MID_IFRAME_TOP_THRESHOLD, Rounding = 1,
+    Callback = function(val)
+        MID_IFRAME_TOP_THRESHOLD = val
+    end,
+})
+
+local PathVisGroup = Tabs.Zones:AddLeftGroupbox('Path Visualisation')
+PathVisGroup:AddToggle('PathVisToggle', {
+    Text     = 'Show Predicted Path',
+    Default  = false,
+    Callback = function(val)
+        PATH_VIS_ENABLED = val
+        if val then buildVisuals() else clearPathVisuals() end
+    end,
+})
+PathVisGroup:AddSlider('PathBeamWidth', {
+    Text = 'Beam Width', Min = 0.1, Max = 2.0, Default = 0.5, Rounding = 1,
+    Callback = function(val)
+        for _, b in ipairs(visBeams) do
+            if b and b.Parent then b.Width0 = val; b.Width1 = val end
+        end
+    end,
+})
+PathVisGroup:AddSlider('PathAlpha', {
+    Text = 'Beam Transparency', Min = 0, Max = 0.9, Default = 0.4, Rounding = 1,
+    Callback = function(val)
+        for _, b in ipairs(visBeams) do
+            if b and b.Parent then b.Transparency = NumberSequence.new(val) end
+        end
+    end,
+})
+
+local OffsetGroup = Tabs.Main:AddRightGroupbox('Dive Offsets (seconds)')
+OffsetGroup:AddSlider('BaseOffset',          { Text='Base Offset (outer zones)',      Min=0, Max=1.0, Default=baseOffset,          Rounding=2, Callback=function(v) baseOffset          = v end })
+OffsetGroup:AddSlider('MidSideOffset',       { Text='Bot Mid-Side Offset (A)',         Min=0, Max=1.0, Default=midSideOffset,       Rounding=2, Callback=function(v) midSideOffset       = v end })
+OffsetGroup:AddSlider('TopMidSideOffset',    { Text='Top Mid-Side Offset (A)',         Min=0, Max=1.0, Default=topMidSideOffset,    Rounding=2, Callback=function(v) topMidSideOffset    = v end })
+OffsetGroup:AddSlider('MidOffsetTop',        { Text='Middle Offset Top (A)',           Min=0, Max=1.0, Default=midOffsetTop,        Rounding=2, Callback=function(v) midOffsetTop        = v end })
+OffsetGroup:AddSlider('MidOffsetBot',        { Text='Middle Offset Bottom (A)',        Min=0, Max=1.0, Default=midOffsetBot,        Rounding=2, Callback=function(v) midOffsetBot        = v end })
+OffsetGroup:AddSlider('MidOffsetIframesTop', { Text='Middle Offset Top (IFRAMES)',     Min=0, Max=1.0, Default=midOffsetIframesTop, Rounding=2, Callback=function(v) midOffsetIframesTop = v end })
+OffsetGroup:AddSlider('MidOffsetIframesBot', { Text='Middle Offset Bottom (IFRAMES)',  Min=0, Max=1.0, Default=midOffsetIframesBot, Rounding=2, Callback=function(v) midOffsetIframesBot = v end })
+OffsetGroup:AddSlider('ModeBBaseOffset',     { Text='Mode B Base Offset',              Min=0, Max=1.0, Default=modeBBaseOffset,     Rounding=2, Callback=function(v) modeBBaseOffset     = v end })
+OffsetGroup:AddSlider('ModeBBotMid',         { Text='Mode B Bot Mid-Side Offset',      Min=0, Max=1.0, Default=modeBBotMidOffset,   Rounding=2, Callback=function(v) modeBBotMidOffset   = v end })
+OffsetGroup:AddSlider('ModeBTopMid',         { Text='Mode B Top Mid-Side Offset',      Min=0, Max=1.0, Default=modeBTopMidOffset,   Rounding=2, Callback=function(v) modeBTopMidOffset   = v end })
+OffsetGroup:AddSlider('ModeBMidOffset',      { Text='Mode B Middle Offset',            Min=0, Max=1.0, Default=modeBMidOffset,      Rounding=2, Callback=function(v) modeBMidOffset      = v end })
+
+local JumpDelayGroup = Tabs.Main:AddRightGroupbox('Jump Delays (seconds)')
+JumpDelayGroup:AddSlider('ModeAJumpDelay',     { Text='Mode A Jump Delay (TOP outer)', Min=0, Max=0.15, Default=modeAJumpDelay,     Rounding=3, Callback=function(v) modeAJumpDelay     = v end })
+JumpDelayGroup:AddSlider('AcroJumpDelay',      { Text='Acro Mode Jump Delay (TOP zones)', Min=0, Max=0.15, Default=acroJumpDelay,   Rounding=3, Callback=function(v) acroJumpDelay      = v end })
+JumpDelayGroup:AddSlider('ModeBJumpDelay',     { Text='Mode B Jump Delay (TOP outer)', Min=0, Max=0.15, Default=modeBJumpDelay,     Rounding=3, Callback=function(v) modeBJumpDelay     = v end })
+JumpDelayGroup:AddSlider('MidTopJumpPreDelay', { Text='TOP Mid Zones Jump Pre-Delay',  Min=0, Max=0.10, Default=midTopJumpPreDelay, Rounding=3, Callback=function(v) midTopJumpPreDelay = v end })
+JumpDelayGroup:AddSlider('M2JumpDelay',        { Text='M2 Mode Jump Delay (TOP zones)', Min=0, Max=0.15, Default=m2JumpDelay,       Rounding=3, Callback=function(v) m2JumpDelay        = v end })
+
+Tabs.Main:AddRightGroupbox('Dive Cooldown'):AddSlider('DiveCooldown', {
+    Text='Cooldown between dives (s)', Min=0, Max=2.0, Default=diveCooldownTime, Rounding=2,
+    Callback=function(v) diveCooldownTime = v end,
+})
+
+local TriggerGroup = Tabs.Settings:AddLeftGroupbox('Mode B Trigger')
+TriggerGroup:AddInput('ModeBSoundID', {
+    Default=MODE_B_SOUND_ID, Numeric=false, Finished=true,
+    Text='Sound ID (rbxassetid://...)', Placeholder='rbxassetid://73498467353516',
+    Callback=function(val) MODE_B_SOUND_ID = val; refreshTrackedSounds(val) end,
+})
+
+-- ── Post Guard UI ─────────────────────────────────────────────────────────────
+local PostGuardGroup = Tabs.Settings:AddLeftGroupbox('Post Guard')
+PostGuardGroup:AddToggle('PostGuardEnabled', {
+    Text     = 'Enable Post Guard',
+    Default  = true,
+    Callback = function(val)
+        postGuardEnabled = val
+    end,
+})
+PostGuardGroup:AddSlider('PostGuardDistance', {
+    Text     = 'Guard Distance (studs)',
+    Min      = 1.0,
+    Max      = 30.0,
+    Default  = 18.2,
+    Rounding = 1,
+    Callback = function(val)
+        POST_GUARD_DISTANCE = val
+    end,
+})
+PostGuardGroup:AddSlider('PostGuardOffsetBonus', {
+    Text     = 'Redirect Offset Bonus (seconds)',
+    Min      = 0.0,
+    Max      = 0.30,
+    Default  = 0.05,
+    Rounding = 2,
+    Callback = function(val)
+        POST_GUARD_OFFSET_BONUS = val
+    end,
+})
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local DiveKeysGroup = Tabs.Settings:AddLeftGroupbox('Dive Keybinds')
+DiveKeysGroup:AddLabel('Dive Right'):AddKeyPicker('DiveLeftKey',   { Default='C',     SyncToggleState=false, Mode='Dynamic', Text='Dive Left',                   NoUI=false })
+DiveKeysGroup:AddLabel('Dive Left'):AddKeyPicker('DiveRightKey', { Default='X',     SyncToggleState=false, Mode='Dynamic', Text='Dive Right',                  NoUI=false })
+DiveKeysGroup:AddLabel('Dive Middle (Top)'):AddKeyPicker('DiveMidTopKey',             { Default='R',   SyncToggleState=false, Mode='Dynamic', Text='Dive Middle (Top)',           NoUI=false })
+DiveKeysGroup:AddLabel('Dive Middle (Bottom)'):AddKeyPicker('DiveMidBotKey',          { Default='R',   SyncToggleState=false, Mode='Dynamic', Text='Dive Middle (Bottom)',        NoUI=false })
+DiveKeysGroup:AddLabel('Dive Middle Top (IFRAMES)'):AddKeyPicker('DiveMidTopIframesKey', { Default='R', SyncToggleState=false, Mode='Dynamic', Text='Dive Middle Top (IFRAMES)',   NoUI=false })
+DiveKeysGroup:AddLabel('Dive Middle Bottom (IFRAMES)'):AddKeyPicker('DiveMidBotIframesKey', { Default='R', SyncToggleState=false, Mode='Dynamic', Text='Dive Middle Bottom (IFRAMES)', NoUI=false })
+DiveKeysGroup:AddLabel('Jump Key'):AddKeyPicker('DiveJumpKey',    { Default='Space', SyncToggleState=false, Mode='Dynamic', Text='Jump Key',                    NoUI=false })
+
+local KeybindGroup = Tabs.Settings:AddLeftGroupbox('Autodive Keybinds')
+KeybindGroup:AddLabel('Autodive Activate'):AddKeyPicker('AutodiveKey',   { Default='U', SyncToggleState=false, Mode='Dynamic', Text='Autodive Activate Key',  NoUI=false })
+KeybindGroup:AddLabel('Switch Hold/Toggle'):AddKeyPicker('SwitchModeKey',{ Default='P', SyncToggleState=false, Mode='Dynamic', Text='Switch Hold/Toggle Key', NoUI=false })
+local ModeDisplayLabel = KeybindGroup:AddLabel('Current Mode: ' .. autodiveMode)
+
+KeybindGroup:AddLabel('M2 Only Mode (Hold/Toggle)'):AddKeyPicker('M2OnlyKey', { Default='T', SyncToggleState=false, Mode='Dynamic', Text='M2 Only Mode Key', NoUI=false })
+KeybindGroup:AddLabel('Acro Mode (Hold/Toggle)'):AddKeyPicker('AcroModeKey', { Default='Y', SyncToggleState=false, Mode='Dynamic', Text='Acro Mode Key', NoUI=false })
+
+local guiVisible   = true
+local zonesVisible = false
+
+KeybindGroup:AddLabel('Hide UI'):AddKeyPicker('HideUIKey',       { Default='Delete', SyncToggleState=false, Mode='Dynamic', Text='Hide UI',               NoUI=false })
+KeybindGroup:AddLabel('Toggle Zones'):AddKeyPicker('ToggleZonesKey', { Default='H', SyncToggleState=false, Mode='Dynamic', Text='Toggle Zone Visibility', NoUI=false })
+
+Library.ToggleKeybind = Options.HideUIKey
+
+local COL_PRETTY = { LEFT="Left", MID_LEFT="Mid-Left", MIDDLE="Middle", MID_RIGHT="Mid-Right", RIGHT="Right" }
+
+local function prettyZone(zn)
+    local r, c = splitZone(zn)
+    if not r then return zn end
+    return "🟥 "..(r=="TOP" and "Top" or "Bottom").." "..(COL_PRETTY[c] or c)
+end
+
+local function resetTracking(reason, keepLabels)
+    tracking         = false
+    currentBallModel = nil
+    missedFrames     = 0
+    StatusLabel:SetText(reason)
+    sharedZones:hideAll()
+    clearPathVisuals()
+    if not keepLabels then
+        PredictedLabel:SetText("Predicted: --")
+        ActualLabel:SetText("Actual: --")
+        DiffLabel:SetText("Difference: --")
+        ZoneLabel:SetText("Zone: --")
+    end
+end
+
+local function activateM2Key()
+    if not m2OnlyModeFromKey then
+        previousAutodiveState = autodiveEnabled
+        if not autodiveEnabled then
+            setAutodiveEnabled(true)
+        end
+        m2OnlyModeFromKey = true
+        updateM2OnlyMode()
+    end
+end
+
+local function deactivateM2Key()
+    if m2OnlyModeFromKey then
+        m2OnlyModeFromKey = false
+        updateM2OnlyMode()
+        setAutodiveEnabled(previousAutodiveState)
+    end
+end
+
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    local key        = inp.KeyCode
+    local actKey     = getPickerKeyCode('AutodiveKey',    'U')
+    local switchKey  = getPickerKeyCode('SwitchModeKey',  'P')
+    local zonesKey   = getPickerKeyCode('ToggleZonesKey', 'H')
+    local m2OnlyKey  = getPickerKeyCode('M2OnlyKey',      'F')
+    local acroKey    = getPickerKeyCode('AcroModeKey',    'T')
+
+    if key == switchKey then
+        autodiveMode = (autodiveMode == "Hold") and "Toggle" or "Hold"
+        ModeDisplayLabel:SetText('Current Mode: ' .. autodiveMode)
+        if autodiveMode == "Hold" then
+            if autodiveEnabled and not m2OnlyModeFromKey then
+                setAutodiveEnabled(false)
+            end
+            if m2OnlyModeFromKey then deactivateM2Key() end
+            if acroModeFromKey   then deactivateAcroKey() end
+        end
+
+    elseif key == actKey then
+        if autodiveMode == "Toggle" then
+            setAutodiveEnabled(not autodiveEnabled)
+        else
+            setAutodiveEnabled(true)
+        end
+
+    elseif key == m2OnlyKey then
+        if autodiveMode == "Toggle" then
+            if m2OnlyModeFromKey then deactivateM2Key() else activateM2Key() end
+        else
+            activateM2Key()
+        end
+
+    elseif key == acroKey then
+        if autodiveMode == "Toggle" then
+            if acroModeFromKey then deactivateAcroKey() else activateAcroKey() end
+        else
+            activateAcroKey()
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(inp, gp)
+    if gp then return end
+    local key       = inp.KeyCode
+    local actKey    = getPickerKeyCode('AutodiveKey',   'U')
+    local m2OnlyKey = getPickerKeyCode('M2OnlyKey',     'F')
+    local acroKey   = getPickerKeyCode('AcroModeKey',   'T')
+
+    if key == actKey and autodiveMode == "Hold" then
+        setAutodiveEnabled(false)
+    elseif key == m2OnlyKey and autodiveMode == "Hold" then
+        deactivateM2Key()
+    elseif key == acroKey and autodiveMode == "Hold" then
+        deactivateAcroKey()
+    end
+end)
+
+local lastModeB     = false
+local mainConnection
+
+mainConnection = RunService.RenderStepped:Connect(function(dt)
+    local now = tick()
+
+    updateMode(now)
+
+    if modeB_active ~= lastModeB then
+        lastModeB = modeB_active
+        applyHeightThreshold()
+    end
+
+    if modeB_active then
+        ModeLabel:SetText(string.format("MODE: B (sound) %.1fs left  | TopY %.1f", modeB_endTime - now, MODE_B_TOP_THRESHOLD))
+    else
+        ModeLabel:SetText("MODE: A (default)  | TopY: " .. string.format("%.1f", MODE_A_TOP_THRESHOLD))
+    end
+
+    if isROnCooldown() then
+        RCooldownLabel:SetText(string.format("R Cooldown: %.1fs remaining", rAbilityCooldownEnd - now))
+    else
+        RCooldownLabel:SetText("R Cooldown: ready ✅")
+    end
+
+    if now < goalCooldownEnd then
+        StatusLabel:SetText(string.format("⏳ Goal Cooldown: %.1fs", goalCooldownEnd - now))
+        clearPathVisuals()
+        return
+    end
+
+    if tracking and (now - trackingStartTime) >= trackingTimeout then
+        resetTracking("⏱ Timed out – cleared")
+    end
+
+    local balls    = getValidBalls()
+    local didTrack = false
+
+    for _, ballData in ipairs(balls) do
+        local model = ballData.model
+        local pos   = ballData.position
+        local vel   = ballData.velocity
+
+        if tracking and model == currentBallModel then
+            local panelNormal = currentPanelCF.LookVector
+            local panelOrigin = currentPanelCF.Position
+            local dist        = math.abs((pos - panelOrigin):Dot(panelNormal))
+            local localPos    = currentPanelCF:PointToObjectSpace(pos)
+            local halfW       = leftGoalSize.X / 2
+            local halfH       = leftGoalSize.Y / 2
+            local inBounds    = math.abs(localPos.X) <= halfW and math.abs(localPos.Y) <= halfH
+
+            local scored = (dist < 2 and inBounds)
+                        or (dist > lastKnownDistance and lastKnownDistance < 3)
+
+            if scored then
+                local actual = now - startTime
+                local diff   = math.abs(predictedTime - actual)
+                ActualLabel:SetText(string.format("Actual: %.3fs ✅", actual))
+                DiffLabel:SetText(diff <= 0.1
+                    and string.format("Difference: %.3fs ✅ GOOD!", diff)
+                    or  string.format("Difference: %.3fs ❌ Adjust!", diff))
+                resetTracking("⚽ GOAL SCORED!", true)
+                goalCooldownEnd = now + 0
+                break
+            end
+            lastKnownDistance = dist
+        end
+
+        local ttg, hitPos = predictPanelHit(pos, vel, ballData.modifiers)
+
+        local validA = not modeB_active and ttg and ttg > 0 and ttg < 5
+        local validB = modeB_active     and ttg and ttg > 0 and ttg < 3 and vel.Magnitude > 0
+        local isCurrentlyTracked = (tracking and model == currentBallModel)
+
+        if validA or validB or isCurrentlyTracked then
+            didTrack = true
+
+            if not tracking or currentBallModel ~= model then
+                tracking          = true
+                currentBallModel  = model
+                startTime         = now
+                trackingStartTime = now
+                missedFrames      = 0
+                lastKnownDistance = math.huge
+            end
+
+            if ttg and hitPos then
+                predictedTime = ttg
+                missedFrames  = 0
+
+                if PATH_VIS_ENABLED then
+                    local pathPoints, bouncePoints = simulatePath(pos, vel, ballData.modifiers, 5, SIM_STEP)
+                    renderPath(pathPoints, bouncePoints)
+                else
+                    clearPathVisuals()
+                end
+
+                local stdHt = modeB_active and MODE_B_TOP_THRESHOLD or MODE_A_TOP_THRESHOLD
+                local znStd = getZoneName(hitPos, currentPanelCF, leftGoalSize,
+                    ZONE_MID_FRAC, ZONE_MID_SIDE_FRAC, stdHt)
+                local _, colForThreshold = splitZone(znStd)
+
+                local effectiveHt = getEffectiveTopThreshold(colForThreshold, ballData.hasIframes)
+                local zn = getZoneName(hitPos, currentPanelCF, leftGoalSize,
+                    ZONE_MID_FRAC, ZONE_MID_SIDE_FRAC, effectiveHt)
+
+                sharedZones:showFullZone(zn)
+                ZoneLabel:SetText(prettyZone(zn))
+
+                if autodiveEnabled and now >= diveCooldownEnd then
+                    -- Apply post guard override before diving
+                    local effectiveZone, wasRedirected = getPostGuardOverride(zn, ballData.hasIframes)
+                    local diveOffset = getDiveOffset(effectiveZone, ballData.hasIframes)
+
+                    if wasRedirected then
+                        diveOffset = diveOffset + POST_GUARD_OFFSET_BONUS
+                        ZoneLabel:SetText(prettyZone(effectiveZone) .. " ⚠️ POST GUARD")
+                    end
+
+                    if ttg <= diveOffset then
+                        diveCooldownEnd = now + diveCooldownTime
+                        task.spawn(function() performDive(effectiveZone, ballData.hasIframes) end)
+                    end
+                end
+
+                StatusLabel:SetText("🏐 Tracking → panel")
+                PredictedLabel:SetText(string.format("Predicted: %.3fs", predictedTime))
+            else
+                missedFrames = missedFrames + 1
+                if missedFrames > 30 then
+                    resetTracking("❌ Lost tracking")
+                else
+                    StatusLabel:SetText("🏐 Tracking (Stable)")
+                end
+            end
+
+            ActualLabel:SetText("Actual: --")
+            DiffLabel:SetText("Difference: --")
+        end
+    end
+
+    if not didTrack and not tracking and now >= goalCooldownEnd then
+        StatusLabel:SetText(string.format("👀 Watching %d ball(s)...", #balls))
+        clearPathVisuals()
+    end
+end)
+
+local ballCamEnabled  = false
+local ballCamSubject  = nil
+local originalSubject = nil
+local originalMinZoom = nil
+local originalMaxZoom = nil
+local ballCamZoom     = 70
+local camera          = workspace.CurrentCamera
+local lp              = Players.LocalPlayer
+
+local ballCamSafetyConnection = nil
+local ballCamInputConnection  = nil
+
+local function disableBallCam()
+    ballCamEnabled = false
+    ballCamSubject = nil
+    camera.CameraType = Enum.CameraType.Custom
+    if originalMinZoom ~= nil then lp.CameraMinZoomDistance = originalMinZoom; originalMinZoom = nil end
+    if originalMaxZoom ~= nil then lp.CameraMaxZoomDistance = originalMaxZoom; originalMaxZoom = nil end
+    local char     = lp and lp.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        camera.CameraSubject = humanoid
+    elseif originalSubject and originalSubject.Parent then
+        camera.CameraSubject = originalSubject
+    end
+    originalSubject = nil
+    StatusLabel:SetText("Ball cam: OFF")
+end
+
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    if inp.KeyCode == Enum.KeyCode.Backspace then
+        if mainConnection          then mainConnection:Disconnect() end
+        if ballCamSafetyConnection then ballCamSafetyConnection:Disconnect() end
+        if ballCamInputConnection  then ballCamInputConnection:Disconnect() end
+        if ballCamEnabled          then disableBallCam() end
+        sharedZones:destroy()
+        destroyVisuals()
+        Library:Unload()
+        pcall(function() script:Destroy() end)
+    end
+end)
+
+local BallCamGroup = Tabs.Settings:AddLeftGroupbox('Ball Cam')
+BallCamGroup:AddLabel('Toggle Ball Cam'):AddKeyPicker('BallCamKey', {
+    Default='J', SyncToggleState=false, Mode='Dynamic', Text='Toggle Ball Cam', NoUI=false,
+})
+BallCamGroup:AddSlider('BallCamZoom', {
+    Text='Ball Cam Zoom Distance', Min=5, Max=150, Default=70, Rounding=0,
+    Callback = function(v)
+        ballCamZoom = v
+        if ballCamEnabled then
+            lp.CameraMinZoomDistance = 0.5
+            lp.CameraMaxZoomDistance = v
+        end
+    end,
+})
+
+local function getClientBalls()
+    local results = {}
+    for _, entity in ipairs(BallFolder:GetChildren()) do
+        if isValidBall(entity) then
+            local cb = entity:FindFirstChild("ClientBall")
+            if cb then table.insert(results, cb) end
+        end
+    end
+    return results
+end
+
+local function enableBallCam()
+    local balls = getClientBalls()
+    if #balls == 0 then
+        StatusLabel:SetText("Ball cam: no ClientBall found")
+        return
+    end
+    local candidates = {}
+    for _, cb in ipairs(balls) do
+        if cb ~= ballCamSubject then table.insert(candidates, cb) end
+    end
+    if #candidates == 0 then candidates = balls end
+    local chosen = candidates[math.random(1, #candidates)]
+    ballCamSubject = chosen
+    ballCamEnabled = true
+    if not originalSubject then originalSubject = camera.CameraSubject end
+    originalMinZoom = lp.CameraMinZoomDistance
+    originalMaxZoom = lp.CameraMaxZoomDistance
+    lp.CameraMinZoomDistance = 0.5
+    lp.CameraMaxZoomDistance = ballCamZoom
+    camera.CameraSubject = chosen
+    camera.CameraType    = Enum.CameraType.Follow
+    StatusLabel:SetText("Ball cam: ON")
+end
+
+ballCamSafetyConnection = RunService.RenderStepped:Connect(function()
+    if ballCamEnabled then
+        if not ballCamSubject or not ballCamSubject.Parent then
+            disableBallCam()
+        end
+    end
+end)
+
+ballCamInputConnection = UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    local ballCamKey = getPickerKeyCode('BallCamKey', 'End')
+    if inp.KeyCode == ballCamKey then
+        if ballCamEnabled then disableBallCam() else enableBallCam() end
+    end
+end)
+
+applyHeightThreshold()
+
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ 'HideUIKey', 'ToggleZonesKey' })
+ThemeManager:SetFolder('GoalPredictor')
+SaveManager:SetFolder('GoalPredictor')
+SaveManager:BuildConfigSection(Tabs.Settings)
+ThemeManager:ApplyToTab(Tabs.Settings)
